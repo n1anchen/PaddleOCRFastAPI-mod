@@ -1,31 +1,47 @@
 # -*- coding: utf-8 -*-
 
 # import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-# import uvicorn
-import yaml
+from fastapi.responses import JSONResponse
+from slowapi.errors import RateLimitExceeded
 
+from database import Base, engine
+from limiter import limiter
 from models.RestfulModel import *
+from models import TaskModel  # noqa: F401 – ensure table is registered before create_all
 from routers import ocr
+from routers import tasks
 from utils.ImageHelper import *
+
+# 启动时建表（若不存在）
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Paddle OCR API",
               description="基于 Paddle OCR 和 FastAPI 的自用接口")
 
+# slowapi 限流
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"resultcode": 429, "message": "请求过于频繁，请稍后再试", "data": []},
+    )
+
 
 # 跨域设置
-origins = [
-    "*"
-]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
 app.include_router(ocr.router)
+app.include_router(tasks.router)
 
 # uvicorn.run(app=app, host="0.0.0.0", port=8000)
