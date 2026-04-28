@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+from contextlib import asynccontextmanager
+
 # import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,13 +14,25 @@ from models.RestfulModel import *
 from models import TaskModel  # noqa: F401 – ensure table is registered before create_all
 from routers import ocr
 from routers import tasks
+from routers.tasks import _ocr_pool
 from utils.ImageHelper import *
 
 # 启动时建表（若不存在）
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Paddle OCR API",
-              description="基于 Paddle OCR 和 FastAPI 的自用接口")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # 服务关闭时优雅地关闭 OCR 进程池
+    _ocr_pool.shutdown(wait=False)
+
+
+app = FastAPI(
+    title="Paddle OCR API",
+    description="基于 Paddle OCR 和 FastAPI 的自用接口",
+    lifespan=lifespan,
+)
 
 # slowapi 限流
 app.state.limiter = limiter

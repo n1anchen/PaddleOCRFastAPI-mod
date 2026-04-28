@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 
+import asyncio
 import json
 import mimetypes
 import re
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
@@ -14,10 +16,14 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from config import RATE_LIMIT, UPLOAD_DIR
-from database import get_db
+from database import SessionLocal, get_db
 from limiter import get_client_ip, limiter
 from models.TaskModel import Task
-from routers.ocr import _run_ocr
+from utils.ocr_worker import run_ocr_file
+
+# 进程池：max_workers=1 保证同一时间只有一个 OCR 进程，
+# 可根据 CPU/GPU 资源适当调大。
+_ocr_pool = ProcessPoolExecutor(max_workers=1)
 
 router = APIRouter(prefix="/ocr", tags=["Tasks"])
 
@@ -62,16 +68,9 @@ def _task_dir(ip: str, task_id: str) -> Path:
     return folder
 
 
-def _process_ocr(task_id: str, image_path: Path, db_url: str):
-    """在后台线程中执行 OCR 并更新数据库。"""
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
-
-    connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
-    engine = create_engine(db_url, connect_args=connect_args)
-    LocalSession = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-    db = LocalSession()
-
+async def _process_ocr_async(task_id: str, image_path: Path) -> None:
+    """异步后台任务：DB 操作在主进程，OCR 推理在独立子进程（不阻塞事件循环）。"""
+    db = SessionLocal()
     try:
         task: Task = db.query(Task).filter(Task.task_id == task_id).first()
         if not task:
@@ -80,15 +79,18 @@ def _process_ocr(task_id: str, image_path: Path, db_url: str):
         task.status = "processing"
         db.commit()
 
-        result = _run_ocr(str(image_path))
+        # 将 CPU 密集的 OCR 推理送入独立进程，事件循环不阻塞
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(_ocr_pool, run_ocr_file, str(image_path))
+
         result_json = json.dumps(result, ensure_ascii=False)
+        (image_path.parent / "result.json").write_text(result_json, encoding="utf-8")
 
-        result_file = image_path.parent / "result.json"
-        result_file.write_text(result_json, encoding="utf-8")
-
-        task.ocr_result = result_json
-        task.status = "done"
-        db.commit()
+        task = db.query(Task).filter(Task.task_id == task_id).first()
+        if task:
+            task.ocr_result = result_json
+            task.status = "done"
+            db.commit()
 
     except Exception as exc:
         db.rollback()
@@ -131,7 +133,6 @@ async def create_task(
     contents = await file.read()
     image_path.write_bytes(contents)
 
-    from config import DATABASE_URL
     task = Task(
         task_id=task_id,
         ip=ip,
@@ -143,7 +144,7 @@ async def create_task(
     db.add(task)
     db.commit()
 
-    background_tasks.add_task(_process_ocr, task_id, image_path, DATABASE_URL)
+    background_tasks.add_task(_process_ocr_async, task_id, image_path)
 
     return TaskCreateResponse(task_id=task_id, status="pending")
 
