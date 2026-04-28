@@ -1,23 +1,102 @@
 # -*- coding: utf-8 -*-
 
+import os
+from pathlib import Path
+
+import requests
 from fastapi import APIRouter, HTTPException, UploadFile, status
+
 from models.OCRModel import *
 from models.RestfulModel import *
-from paddleocr import PaddleOCR
 from utils.ImageHelper import base64_to_ndarray, bytes_to_ndarray
-import requests
-import os
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_PDX_CACHE_HOME = PROJECT_ROOT / ".paddlex"
+os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(DEFAULT_PDX_CACHE_HOME))
+# Disable OneDNN/MKL-DNN by default to avoid a PIR attribute conversion bug
+# in Paddle Inference on Windows (onednn_instruction.cc:118)
+os.environ.setdefault("PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT", "0")
+
+from paddleocr import PaddleOCR
 
 OCR_LANGUAGE = os.environ.get("OCR_LANGUAGE", "ch")
+OCR_MODEL_DIR = Path(
+    os.environ.get("OCR_MODEL_DIR", str(PROJECT_ROOT / ".paddleocr"))
+).expanduser().resolve()
+
+DEFAULT_MODEL_DIRS = {
+    "text_detection_model_dir": OCR_MODEL_DIR / "ch_PP-OCRv4_det_infer",
+    "text_recognition_model_dir": OCR_MODEL_DIR / "ch_PP-OCRv4_rec_infer",
+    "textline_orientation_model_dir": OCR_MODEL_DIR / "ch_ppocr_mobile_v2.0_cls_infer",
+}
+
+
+def _resolve_model_dir(env_name: str, default_dir: Path) -> Path:
+    configured_dir = os.environ.get(env_name)
+    if configured_dir:
+        return Path(configured_dir).expanduser().resolve()
+    return default_dir
+
+
+def _build_ocr() -> PaddleOCR:
+    OCR_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    model_dirs = {
+        name: _resolve_model_dir(env_name, default_dir)
+        for name, env_name, default_dir in (
+            (
+                "text_detection_model_dir",
+                "OCR_TEXT_DETECTION_MODEL_DIR",
+                DEFAULT_MODEL_DIRS["text_detection_model_dir"],
+            ),
+            (
+                "text_recognition_model_dir",
+                "OCR_TEXT_RECOGNITION_MODEL_DIR",
+                DEFAULT_MODEL_DIRS["text_recognition_model_dir"],
+            ),
+            (
+                "textline_orientation_model_dir",
+                "OCR_TEXTLINE_ORIENTATION_MODEL_DIR",
+                DEFAULT_MODEL_DIRS["textline_orientation_model_dir"],
+            ),
+        )
+    }
+
+    has_explicit_model_dirs = any(
+        os.environ.get(env_name)
+        for env_name in (
+            "OCR_TEXT_DETECTION_MODEL_DIR",
+            "OCR_TEXT_RECOGNITION_MODEL_DIR",
+            "OCR_TEXTLINE_ORIENTATION_MODEL_DIR",
+        )
+    )
+    has_local_chinese_models = OCR_LANGUAGE == "ch" and all(
+        model_dir.exists() for model_dir in model_dirs.values()
+    )
+
+    if has_explicit_model_dirs or has_local_chinese_models:
+        return PaddleOCR(
+            use_textline_orientation=True,
+            text_detection_model_dir=str(model_dirs["text_detection_model_dir"]),
+            text_recognition_model_dir=str(model_dirs["text_recognition_model_dir"]),
+            textline_orientation_model_dir=str(model_dirs["textline_orientation_model_dir"]),
+        )
+
+    return PaddleOCR(use_angle_cls=True, lang=OCR_LANGUAGE)
 
 router = APIRouter(prefix="/ocr", tags=["OCR"])
 
-ocr = PaddleOCR(use_angle_cls=True, lang=OCR_LANGUAGE)
+ocr = _build_ocr()
+
+
+def _run_ocr(image):
+    results = ocr.ocr(image)
+    return [r.json.get("res", r.json) for r in results]
 
 
 @router.get('/predict-by-path', response_model=RestfulModel, summary="识别本地图片")
 def predict_by_path(image_path: str):
-    result = ocr.ocr(image_path, cls=True)
+    result = _run_ocr(image_path)
     restfulModel = RestfulModel(
         resultcode=200, message="Success", data=result, cls=OCRModel)
     return restfulModel
@@ -26,7 +105,7 @@ def predict_by_path(image_path: str):
 @router.post('/predict-by-base64', response_model=RestfulModel, summary="识别 Base64 数据")
 def predict_by_base64(base64model: Base64PostModel):
     img = base64_to_ndarray(base64model.base64_str)
-    result = ocr.ocr(img=img, cls=True)
+    result = _run_ocr(img)
     restfulModel = RestfulModel(
         resultcode=200, message="Success", data=result, cls=OCRModel)
     return restfulModel
@@ -41,7 +120,7 @@ async def predict_by_file(file: UploadFile):
         file_data = file.file
         file_bytes = file_data.read()
         img = bytes_to_ndarray(file_bytes)
-        result = ocr.ocr(img=img, cls=True)
+        result = _run_ocr(img)
         restfulModel.data = result
     else:
         raise HTTPException(
@@ -59,7 +138,7 @@ async def predict_by_url(imageUrl: str):
     if image_bytes.startswith(b"\xff\xd8\xff") or image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):  # 只处理常见格式图片 (jpg / png)
         restfulModel.resultcode = 200
         img = bytes_to_ndarray(image_bytes)
-        result = ocr.ocr(img=img, cls=True)
+        result = _run_ocr(img)
         restfulModel.data = result
         restfulModel.message = "Success"
     else:

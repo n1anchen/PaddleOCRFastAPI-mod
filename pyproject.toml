@@ -1,0 +1,22 @@
+[project]
+name = "PaddleOCRFastAPI"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.135.1",
+    "numpy>=2.4.3",
+    "paddleocr>=3.4.0",
+    "paddlepaddle>=3.3.0",
+    "python-multipart>=0.0.22",
+    "pyyaml>=6.0.2",
+    "requests>=2.32.5",
+    "uvicorn>=0.41.0",
+    "charset_normalizer>=2.0.0,<3.0.0",
+    "chardet>=3.0.2,<4.0.0",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true

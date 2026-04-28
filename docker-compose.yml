@@ -9,6 +9,8 @@ services:
     environment:
       - TZ=Asia/Hong_Kong
       - OCR_LANGUAGE=ch
+      - OCR_MODEL_DIR=/app/.paddleocr
+      - PADDLE_PDX_CACHE_HOME=/app/.paddlex
     ports:
     - "8000:8000" # 自定义服务暴露端口, 8000为FastAPI默认端口, 不做修改,只能改前面的8000,不要忘了引号
     restart: unless-stopped
