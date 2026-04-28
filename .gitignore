@@ -2,3 +2,5 @@ __pycache__/
 test.py
 .paddlex/
 .python-version
+uploads/
+ocr_tasks.db
