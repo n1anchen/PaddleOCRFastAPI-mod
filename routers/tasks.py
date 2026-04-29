@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -43,6 +43,7 @@ class TaskDetailResponse(BaseModel):
     created_at: datetime
     status: str
     original_filename: Optional[str]
+    use_doc_preprocessor: bool = False
     ocr_result: Optional[Any]
     error_msg: Optional[str]
 
@@ -76,12 +77,19 @@ async def _process_ocr_async(task_id: str, image_path: Path) -> None:
         if not task:
             return
 
+        use_doc_preprocessor = bool(task.use_doc_preprocessor)
+
         task.status = "processing"
         db.commit()
 
         # 将 CPU 密集的 OCR 推理送入独立进程，事件循环不阻塞
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(_ocr_pool, run_ocr_file, str(image_path))
+        result = await loop.run_in_executor(
+            _ocr_pool,
+            run_ocr_file,
+            str(image_path),
+            use_doc_preprocessor,
+        )
 
         result_json = json.dumps(result, ensure_ascii=False)
         (image_path.parent / "result.json").write_text(result_json, encoding="utf-8")
@@ -116,6 +124,7 @@ async def create_task(
     request: Request,
     file: UploadFile,
     background_tasks: BackgroundTasks,
+    use_doc_preprocessor: bool = Form(False),
     db: Session = Depends(get_db),
 ):
     suffix = Path(file.filename).suffix.lower() if file.filename else ""
@@ -140,6 +149,7 @@ async def create_task(
         status="pending",
         original_filename=file.filename,
         file_dir=str(task_dir),
+        use_doc_preprocessor=use_doc_preprocessor,
     )
     db.add(task)
     db.commit()
@@ -172,6 +182,7 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
         created_at=task.created_at,
         status=task.status,
         original_filename=task.original_filename,
+        use_doc_preprocessor=bool(task.use_doc_preprocessor),
         ocr_result=ocr_result,
         error_msg=task.error_msg,
     )
@@ -226,6 +237,7 @@ def list_tasks(
                 ocr_result = json.loads(task.ocr_result)
             except json.JSONDecodeError:
                 ocr_result = task.ocr_result
+
         items.append(
             TaskDetailResponse(
                 task_id=task.task_id,
@@ -233,6 +245,7 @@ def list_tasks(
                 created_at=task.created_at,
                 status=task.status,
                 original_filename=task.original_filename,
+                use_doc_preprocessor=bool(task.use_doc_preprocessor),
                 ocr_result=ocr_result,
                 error_msg=task.error_msg,
             )

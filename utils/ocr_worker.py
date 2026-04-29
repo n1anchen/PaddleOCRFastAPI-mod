@@ -8,13 +8,14 @@ OCR worker 函数，专供 ProcessPoolExecutor 使用。
 import os
 from pathlib import Path
 
-_ocr_instance = None
+_ocr_instances = {}
 
 
-def _get_ocr():
-    global _ocr_instance
-    if _ocr_instance is not None:
-        return _ocr_instance
+def _get_ocr(use_doc_preprocessor: bool = False):
+    global _ocr_instances
+    cache_key = bool(use_doc_preprocessor)
+    if cache_key in _ocr_instances:
+        return _ocr_instances[cache_key]
 
     PROJECT_ROOT = Path(__file__).resolve().parent.parent
     os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(PROJECT_ROOT / ".paddlex"))
@@ -60,9 +61,15 @@ def _get_ocr():
         d.exists() for d in model_dirs.values()
     )
 
+    preprocess_kwargs = {
+        "use_doc_orientation_classify": cache_key,
+        "use_doc_unwarping": cache_key,
+    }
+
     if has_explicit or has_local_ch:
-        _ocr_instance = PaddleOCR(
+        ocr = PaddleOCR(
             use_textline_orientation=True,
+            **preprocess_kwargs,
             text_detection_model_dir=str(model_dirs["text_detection_model_dir"]),
             text_recognition_model_dir=str(model_dirs["text_recognition_model_dir"]),
             textline_orientation_model_dir=str(
@@ -70,14 +77,19 @@ def _get_ocr():
             ),
         )
     else:
-        _ocr_instance = PaddleOCR(use_angle_cls=True, lang=OCR_LANGUAGE)
+        ocr = PaddleOCR(
+            use_angle_cls=True,
+            **preprocess_kwargs,
+            lang=OCR_LANGUAGE,
+        )
 
-    return _ocr_instance
+    _ocr_instances[cache_key] = ocr
+    return ocr
 
 
-def run_ocr_file(image_path: str) -> list:
+def run_ocr_file(image_path: str, use_doc_preprocessor: bool = False) -> list:
     """在 worker 进程中执行 OCR 识别，结果为可序列化的 list。
     此函数必须是顶层函数以支持跨进程 pickle。"""
-    ocr = _get_ocr()
+    ocr = _get_ocr(use_doc_preprocessor=use_doc_preprocessor)
     results = ocr.ocr(image_path)
     return [r.json.get("res", r.json) for r in results]
