@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import mimetypes
 import re
 import uuid
@@ -10,20 +11,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from config import RATE_LIMIT, UPLOAD_DIR
+from config import MAX_CONCURRENT_OCR, RATE_LIMIT, UPLOAD_DIR
 from database import SessionLocal, get_db
 from limiter import get_client_ip, limiter
 from models.TaskModel import Task
 from utils.ocr_worker import run_ocr_file
 
-# 进程池：max_workers=1 保证同一时间只有一个 OCR 进程，
-# 可根据 CPU/GPU 资源适当调大。
-_ocr_pool = ProcessPoolExecutor(max_workers=1)
+logger = logging.getLogger(__name__)
+
+# 进程池：max_workers 与 MAX_CONCURRENT_OCR 保持一致
+_ocr_pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT_OCR)
+
+# 应用层任务队列：存放 (task_id, image_path) 元组
+_task_queue: asyncio.Queue[tuple[str, Path]] = asyncio.Queue()
+# 长运行 worker 协程的 Task 句柄，用于 lifespan 关闭时取消
+_worker_tasks: list[asyncio.Task] = []
 
 router = APIRouter(prefix="/ocr", tags=["Tasks"])
 
@@ -54,6 +61,7 @@ class TaskDetailResponse(BaseModel):
     ocr_image_variant: str = "original"
     ocr_result: Optional[Any]
     error_msg: Optional[str]
+    queue_position: Optional[int] = None  # queued 时的排队位置（1-based）
 
 
 class TaskListResponse(BaseModel):
@@ -112,7 +120,11 @@ def _resolve_ocr_image_variant(task: Task, ocr_result: Optional[Any]) -> str:
     return "corrected" if bool(task.use_doc_preprocessor) else "original"
 
 
-def _build_task_response(task: Task, ocr_result: Optional[Any]) -> TaskDetailResponse:
+def _build_task_response(
+    task: Task,
+    ocr_result: Optional[Any],
+    queue_position: Optional[int] = None,
+) -> TaskDetailResponse:
     task_dir = Path(task.file_dir) if task.file_dir else None
     image_variants = (
         _build_image_variants(task.task_id, task_dir)
@@ -138,11 +150,62 @@ def _build_task_response(task: Task, ocr_result: Optional[Any]) -> TaskDetailRes
         ocr_image_variant=ocr_image_variant,
         ocr_result=ocr_result,
         error_msg=task.error_msg,
+        queue_position=queue_position,
     )
 
 
+# ── Queue workers ─────────────────────────────────────────────────────────────
+
+async def _ocr_queue_worker() -> None:
+    """长运行协程：从队列中取任务并依次处理。"""
+    while True:
+        task_id, image_path = await _task_queue.get()
+        try:
+            await _process_ocr_async(task_id, image_path)
+        except Exception:
+            logger.exception("OCR worker 遇到未捕获异常，task_id=%s", task_id)
+        finally:
+            _task_queue.task_done()
+
+
+async def start_workers() -> None:
+    """启动 MAX_CONCURRENT_OCR 个 worker 协程，并将 DB 中残留的 queued 任务重新入队。"""
+    for _ in range(MAX_CONCURRENT_OCR):
+        t = asyncio.create_task(_ocr_queue_worker())
+        _worker_tasks.append(t)
+
+    # 崩溃恢复：将上次运行中未完成的 queued/processing 任务重新入队
+    db = SessionLocal()
+    try:
+        stuck = (
+            db.query(Task)
+            .filter(Task.status.in_(["queued", "processing"]))
+            .order_by(Task.created_at)
+            .all()
+        )
+        for task in stuck:
+            if task.file_dir:
+                task_dir = Path(task.file_dir)
+                candidates = list(task_dir.glob("original.*"))
+                if candidates:
+                    task.status = "queued"  # 统一重置为 queued
+                    db.commit()
+                    await _task_queue.put((task.task_id, candidates[0]))
+                    logger.info("崩溃恢复：重新入队 task_id=%s", task.task_id)
+    finally:
+        db.close()
+
+
+async def stop_workers() -> None:
+    """取消所有 worker 协程，等待队列排空。"""
+    for t in _worker_tasks:
+        t.cancel()
+    await asyncio.gather(*_worker_tasks, return_exceptions=True)
+    _worker_tasks.clear()
+
+
 async def _process_ocr_async(task_id: str, image_path: Path) -> None:
-    """异步后台任务：DB 操作在主进程，OCR 推理在独立子进程（不阻塞事件循环）。"""
+    """异步协程：将 queued 任务转为 processing 再送入进程池推理。"""
     db = SessionLocal()
     try:
         task: Task = db.query(Task).filter(Task.task_id == task_id).first()
@@ -195,7 +258,6 @@ async def _process_ocr_async(task_id: str, image_path: Path) -> None:
 async def create_task(
     request: Request,
     file: UploadFile,
-    background_tasks: BackgroundTasks,
     use_doc_preprocessor: bool = Form(False),
     db: Session = Depends(get_db),
 ):
@@ -218,7 +280,7 @@ async def create_task(
         task_id=task_id,
         ip=ip,
         created_at=datetime.utcnow(),
-        status="pending",
+        status="queued",
         original_filename=file.filename,
         file_dir=str(task_dir),
         use_doc_preprocessor=use_doc_preprocessor,
@@ -226,9 +288,9 @@ async def create_task(
     db.add(task)
     db.commit()
 
-    background_tasks.add_task(_process_ocr_async, task_id, image_path)
+    await _task_queue.put((task_id, image_path))
 
-    return TaskCreateResponse(task_id=task_id, status="pending")
+    return TaskCreateResponse(task_id=task_id, status="queued")
 
 
 @router.get(
@@ -248,7 +310,17 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
         except json.JSONDecodeError:
             ocr_result = task.ocr_result
 
-    return _build_task_response(task, ocr_result)
+    # 计算排队位置：比本任务更早入队（created_at 更小）且仍在 queued 的任务数 + 1
+    queue_position: Optional[int] = None
+    if task.status == "queued":
+        ahead = (
+            db.query(Task)
+            .filter(Task.status == "queued", Task.created_at < task.created_at)
+            .count()
+        )
+        queue_position = ahead + 1
+
+    return _build_task_response(task, ocr_result, queue_position)
 
 
 @router.get(

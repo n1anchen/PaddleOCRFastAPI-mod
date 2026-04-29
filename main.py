@@ -14,7 +14,7 @@ from models.RestfulModel import *
 from models import TaskModel  # noqa: F401 – ensure table is registered before create_all
 from routers import ocr
 from routers import tasks
-from routers.tasks import _ocr_pool
+from routers.tasks import _ocr_pool, start_workers, stop_workers
 from utils.ImageHelper import *
 
 # 启动时建表（若不存在）
@@ -23,8 +23,11 @@ Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 启动 OCR 任务队列 worker（含崩溃恢复）
+    await start_workers()
     yield
-    # 服务关闭时优雅地关闭 OCR 进程池
+    # 关闭 worker 协程，再关闭进程池
+    await stop_workers()
     _ocr_pool.shutdown(wait=False)
 
 

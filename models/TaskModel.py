@@ -13,7 +13,7 @@ class Task(Base):
     task_id = Column(String(36), primary_key=True, index=True)
     ip = Column(String(64), nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-    status = Column(String(20), default="pending")  # pending / processing / done / failed
+    status = Column(String(20), default="queued")  # queued / processing / done / failed
     original_filename = Column(String(255), nullable=True)
     file_dir = Column(String(512), nullable=True)
     use_doc_preprocessor = Column(Boolean, nullable=False, default=False)
