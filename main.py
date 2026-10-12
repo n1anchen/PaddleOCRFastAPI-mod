@@ -14,7 +14,7 @@ from models.RestfulModel import *
 from models import TaskModel  # noqa: F401 – ensure table is registered before create_all
 from routers import ocr
 from routers import tasks
-from routers.tasks import _ai_pool, _ocr_pool, start_workers, stop_workers
+from routers.tasks import _ai_pool, start_workers, stop_workers
 from schema_migrations import ensure_task_page_organization_columns
 from utils.ImageHelper import *
 
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
     yield
     # 关闭 worker 协程，再关闭进程池
     await stop_workers()
-    _ocr_pool.shutdown(wait=False)
+    tasks._ocr_pool.shutdown(wait=False, cancel_futures=True)
     _ai_pool.shutdown(wait=False, cancel_futures=True)
 
 

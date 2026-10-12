@@ -5,6 +5,7 @@ import ipaddress
 import json
 import logging
 import mimetypes
+import multiprocessing
 import re
 import shutil
 import uuid
@@ -57,7 +58,17 @@ from utils.text_organizer import (
 logger = logging.getLogger(__name__)
 
 # OCR 模型与 PDF 渲染均在进程池中执行，避免阻塞 FastAPI 事件循环。
-_ocr_pool = ProcessPoolExecutor(max_workers=MAX_CONCURRENT_OCR)
+# Start OCR workers with spawn so native Paddle/OpenCV state is never inherited
+# from the already-running web process. This avoids fork-related worker crashes.
+# Each worker therefore starts with a clean Python interpreter.
+def _create_ocr_pool() -> ProcessPoolExecutor:
+    return ProcessPoolExecutor(
+        max_workers=MAX_CONCURRENT_OCR,
+        mp_context=multiprocessing.get_context("spawn"),
+    )
+
+
+_ocr_pool = _create_ocr_pool()
 _ocr_pool_lock = asyncio.Lock()
 
 # llama.cpp 自身管理 CPU 线程；单独的单 worker 线程池保证模型只加载一份。
@@ -690,7 +701,7 @@ def _write_manifest(task: Task, pages: list[TaskPage]) -> None:
 
 
 async def _run_in_ocr_pool(function, *args):
-    """Run work in the OCR pool and replace a pool whose child has died."""
+    """Run work in the OCR pool, rebuilding and retrying after one crash."""
     global _ocr_pool
 
     active_pool = _ocr_pool
@@ -711,11 +722,14 @@ async def _run_in_ocr_pool(function, *args):
                     )
                 except Exception:
                     logger.exception("释放已损坏 OCR 进程池失败")
-                _ocr_pool = ProcessPoolExecutor(
-                    max_workers=MAX_CONCURRENT_OCR
-                )
+                _ocr_pool = _create_ocr_pool()
                 logger.error("OCR 子进程异常退出，已重建进程池")
-        raise
+        logger.warning("OCR task will retry once with the replacement pool")
+        return await loop.run_in_executor(
+            _ocr_pool,
+            function,
+            *args,
+        )
 
 
 # ── Queue workers ─────────────────────────────────────────────────────────────

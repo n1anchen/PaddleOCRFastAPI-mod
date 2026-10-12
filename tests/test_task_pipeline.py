@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -63,6 +64,36 @@ class TaskPipelineTests(unittest.TestCase):
             self.assertFalse(tasks._ensure_rule_result(page))
         builder.assert_called_once_with(page)
         self.assertEqual(json.loads(page.rule_result), rebuilt)
+
+    def test_broken_ocr_pool_is_rebuilt_and_current_work_retried_once(self):
+        first_pool = ThreadPoolExecutor(max_workers=1)
+        replacement_pool = ThreadPoolExecutor(max_workers=1)
+        attempts = 0
+
+        def flaky_work():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise BrokenProcessPool("simulated worker exit")
+            return "completed after recovery"
+
+        try:
+            with (
+                patch.object(tasks, "_ocr_pool", first_pool),
+                patch.object(
+                    tasks,
+                    "_create_ocr_pool",
+                    return_value=replacement_pool,
+                ) as create_pool,
+            ):
+                result = asyncio.run(tasks._run_in_ocr_pool(flaky_work))
+
+            self.assertEqual(result, "completed after recovery")
+            self.assertEqual(attempts, 2)
+            create_pool.assert_called_once_with()
+        finally:
+            first_pool.shutdown(wait=True)
+            replacement_pool.shutdown(wait=True)
 
     def test_old_image_task_is_exposed_as_one_page(self):
         task_dir = self.root / "legacy"
